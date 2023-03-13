@@ -2,11 +2,11 @@
   (:require [babashka.pods :as pods]
             [clojure.set :as set]
             [clojure.string :as str]
-            [hiccup2.core :refer [html]]
+            [hiccup2.core :refer [html raw]]
             [honey.sql :as sql]
             [honey.sql.helpers :as h]
             [org.httpkit.server :as httpkit]
-            [rda-visualizer.db :refer [query]])) 
+            [rda-visualizer.db :refer [query]]))
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
 (require '[pod.babashka.go-sqlite3 :as sqlite])
@@ -55,35 +55,11 @@
 ;; - :subPropertyOf[2]
 
 (comment
-  (sqlite/query db (str "select * from " (name table) " where \"*type\" = 'class' limit 1"))
+  (sqlite/query db (str "select * from " (name table) " where \"subClassOf[0]\" is not null limit 1"))
   (sqlite/query db (str "select \"*uri\", count(\"*uri\") from " (name table) " group by \"*uri\" having count(\"*uri\") > 1"))
   (apply clojure.data/diff (sqlite/query db (str "select * from " (name table) " where \"*uri\" = 'rdau:P60952'")))
 
-  (sqlite/query db (str "select id from " (name table) " where \"*uri\" = 'rdac:C10001' limit 1"))
-  )
-
-(defn traverse [row col-prefix]
-  (let [cols (->> row keys (map name)
-                  (filter #(str/starts-with? % col-prefix))
-                  (map keyword))
-        go (fn [explore seen])] ;TODO finish. Maybe a CTE? Nah, DFS
-    go (set ((apply juxt cols) row))))
-
-(defn same-uri-as [{id :id, uri :*uri}]
-  (when-let [others (-> (h/select :id)
-                        (h/where [:= :*uri uri]
-                                 [:not= :id id])
-                        query
-                        seq)]
-    (list [:h4 "Same URI as"]
-          (for [o others]
-            [:a {:href (str "/" (:id o))} (:id o)]))))
-
-(defn general-attributes [row]
-  (list [:dt "Description"]
-        [:dd ((keyword "description[0]_en") row)]
-        [:dt "Note"]
-        [:dd ((keyword "note[0]_en") row)]))
+  (sqlite/query db (str "select id from " (name table) " where \"*uri\" = 'rdac:C10001' limit 1")))
 
 (def styles
   "
@@ -100,9 +76,98 @@
    }
    dd {
      grid-column: 2;
+     margin-left: 1em;
+   }
+   .label:not(:last-child):after {
+     content: \", \";
+   }
+   .primary-label {
+     font-weight: 500;
+   }
+   ul.inheritance {
+     list-style-type: none;
+     padding-left: 0;
+     margin-bottom: 0;
+   }
+   ul.inheritance li {
+     padding-left: 1em;
+     margin-bottom: 0;
+   }
+   dd > ul.inheritance > li {
+     padding-left: 0;
    }
    ")
-  ;;  long descriptions are leaking underneath the definition
+
+(defn traverse [row col-prefix]
+  (let [cols (->> row keys (map name)
+                  (filter #(str/starts-with? % col-prefix))
+                  (map keyword))
+        col-vals (comp set (apply juxt cols))
+        dfs (fn dfs [explore seen]
+              (into
+               {}
+               (for [uri explore
+                     :when (not (seen uri))
+                     ;; Some rows share uris, we just pick the first arbitrarily since we show the
+                     ;; correspondence in the ui so users can always navigate from whichever one we
+                     ;; picked to the other
+                     :let [row (-> (apply h/select [:*])
+                                   (h/where := :*uri uri)
+                                   (h/limit 1)
+                                   query first)]]
+                 ;; This is not tail-recursive, but the max depths are likely to be small and it's
+                 ;; way easier to build a tree this way
+                 [row (dfs (filter some? (col-vals row))
+                           (conj seen uri))])))]
+    (dfs (filter some? (col-vals row)) #{(:*uri row)})))
+(comment
+  (traverse (-> (h/select :*) (h/where [:is-not (keyword "subClassOf[0]") nil]) (h/limit 1) query first)
+            "subClassOf")
+  ;; => {"rdac:C10013" {}}
+  ;; ish, keys are whole rows
+  
+  )
+
+(defn label [row]
+  (or (:ToolkitLabel_en row) (:*label_en row)))
+
+(defn same-uri-as [{id :id, uri :*uri}]
+  (when-let [others (-> (h/select :id)
+                        (h/where [:= :*uri uri]
+                                 [:not= :id id])
+                        query
+                        seq)]
+    (list [:h4 "Same URI as"]
+          (for [o others]
+            [:a {:href (str "/" (:id o))} (:id o)]))))
+
+(defn general-attributes [row]
+  (letfn [(get-or-none [k] (-> k keyword row (as-> $ (if-not $ "-" $))))]
+    (list [:dt "Description"] [:dd (get-or-none "description[0]_en")]
+          [:dt "Note"] [:dd (get-or-none "note[0]_en")]
+          [:dt "Labels"] [:dd [:span.label.primary-label (get-or-none "*label_en")]
+                          (->> (range 9) (map #(str "altLabel[" % "]_en"))
+                               (map (comp row keyword)) (filter some?)
+                               (map #(vector :span.label.alt-label %)))]
+          [:dt "Instruction number"] [:dd (get-or-none "instructionNumber")]
+          [:dt "Lexical alias"] [:dd (get-or-none "lexicalAlias_en")]
+          [:dt "Status"] [:dd (get-or-none "*status")])))
+
+(defn subclass-of [row]
+  (let [parents (traverse row "subClassOf")
+        nested-list (fn nested-list [parents]
+                      (when (some seq parents)
+                        [:ul.inheritance
+                         (for [[row parents] parents]
+                           [:li [:a {:href (str "/" (:id row))} (label row)]
+                            (when (seq parents)
+                              (nested-list parents))])]))]
+    (list [:dt "Subclass of"]
+          [:dd (or (nested-list parents) "-")])))
+
+;; TODO
+;; - tooltip for description of superclasses on mouseover
+;; - superclasses
 
 (defn by-id [{[id] :params}]
   (if-let [row (-> (h/select :*)
@@ -119,14 +184,16 @@
         [:head
          [:title "RDA Visualizer"]
          [:link {:rel "stylesheet" :href "https://unpkg.com/sakura.css/css/sakura.css" :type "text/css"}]
-         [:style styles]]
+         [:style (raw styles)]]
         [:body
          [:main
-          [:h1 (:*type row) ": " (or (:ToolkitLabel_en row) (:*label_en row))]
+          [:h1 (:*type row) ": " (label row)]
           [:div.subtitle (:*uri row)]
           (same-uri-as row)
           [:dl
-           (general-attributes row)]]]]))}
+           (general-attributes row)
+           (when (= "class" (:*type row))
+             (subclass-of row))]]]]))}
     {:status 404}))
 
 (def routes {[:get #"/([a-zA-Z0-9:.]+)"] #'by-id})
@@ -138,7 +205,6 @@
   (if-let [[handler req']
            (->> routes
                 (keep (fn [[[method pattern] handler]]
-                        [method pattern handler]
                         (when (and (= method (:request-method req))
                                    (some? (re-matches pattern (:uri req))))
                                          ;; `rest` b/c the first group is always the whole match
@@ -166,5 +232,4 @@
   (add-tap #(swap! log conj %))
   (reset! log [])
   (start-server!)
-  (stop-server!)
-  )
+  (stop-server!))
