@@ -3,8 +3,10 @@
             [babashka.pods :as pods]
             [clojure.data.csv :as csv]
             [clojure.java.io :as io]
+            [clojure.string :as str]
+            [honey.sql :as sql]
             [honey.sql.helpers :as h]
-            [honey.sql :as sql]))
+            [rda-visualizer.db :refer [db table]]))
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
 (require '[pod.babashka.go-sqlite3 :as sqlite])
@@ -42,9 +44,6 @@
        set)
   )
 
-(def db "triples.sqlite3")
-(def table :elements)
-
 (defn make-schema []
   (->> (csv-headers)
        (mapcat second)
@@ -60,13 +59,16 @@
       (h/values rows)
       sql/format))
 
+(defn empty-str->nil [row]
+  (map #(if (str/blank? %) nil %) row))
+
 (defn load-db []
   (dorun
    (with-read-files [rdr f]
      (let [[[cols] rows] (split-at 1 (csv/read-csv rdr))]
        (doseq [batch (partition-all 300 (map #(into [(str (fs/file-name f) ":" %1)] %2) (range 1 9999999) rows))]
          (sqlite/execute! db (insert (into [:id] cols)
-                                     batch)))))))
+                                     (map empty-str->nil batch))))))))
 
 (defn make-db []
   (fs/delete-if-exists db)
