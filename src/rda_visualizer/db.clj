@@ -12,5 +12,6 @@
 (defn query [q]
   (-> q
       (h/from table)
+      (as-> $ (if (:select $) $ (h/select $ :*)))
       sql/format
       (as-> $ (sqlite/query db $))))
