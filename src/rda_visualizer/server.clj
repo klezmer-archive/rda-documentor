@@ -63,20 +63,32 @@
 
 (def styles
   "
+   a {
+     color: #0001ee;
+   }
+   a:visited {
+     color: #551a8b;
+   }
    .subtitle {
      font-style: italic;
    }
    dl {
      display: grid;
-     grid-template-columns: auto auto;
+     grid-template-columns: max-content auto;
    }
    dt {
      grid-column: 1;
      font-weight: bold;
+     padding-bottom: 0.75em;
+     text-align: right;
+   }
+   dt:after {
+     content: \":\";
    }
    dd {
      grid-column: 2;
      margin-left: 1em;
+     padding-bottom: 0.75em;
    }
    .label:not(:last-child):after {
      content: \", \";
@@ -85,16 +97,43 @@
      font-weight: 500;
    }
    ul.inheritance {
-     list-style-type: none;
      padding-left: 0;
      margin-bottom: 0;
+     list-style: disc;
    }
    ul.inheritance li {
-     padding-left: 1em;
      margin-bottom: 0;
+     margin-left: 1em;
+   }
+   dd > ul.inheritance {
+     list-style-type: none;
    }
    dd > ul.inheritance > li {
      padding-left: 0;
+     margin-left: 0;
+   }
+   .tooltip .tooltip-text {
+     visibility: hidden;
+     position: absolute;
+     transform: translate(10px, -10px);
+     max-width: 40%;
+     border: solid;
+     border-radius: 15px;
+     padding: 0.25em;
+     color: initial;
+     background-color: white;
+   }
+   .tooltip:hover .tooltip-text {
+     visibility: visible;
+   }
+   /* The arrow */
+   .tooltip .tooltip-text::after {
+     content: \" \";
+     border:10px solid #000;
+     border-color: transparent black transparent transparent;
+     position: absolute;
+     top: 15px;
+     left: -20px;
    }
    ")
 
@@ -128,8 +167,16 @@
   
   )
 
+(defn- get-or-none [row k]
+  (-> k keyword row (as-> $ (if-not $ "-" $))))
+
 (defn label [row]
   (or (:ToolkitLabel_en row) (:*label_en row)))
+
+(defn entity-link [row]
+  [:a.tooltip {:href (str "/" (:id row))}
+   (label row)
+   [:span.tooltip-text (get-or-none row "description[0]_en")]])
 
 (defn same-uri-as [{id :id, uri :*uri}]
   (when-let [others (-> (h/select :id)
@@ -142,16 +189,15 @@
             [:a {:href (str "/" (:id o))} (:id o)]))))
 
 (defn general-attributes [row]
-  (letfn [(get-or-none [k] (-> k keyword row (as-> $ (if-not $ "-" $))))]
-    (list [:dt "Description"] [:dd (get-or-none "description[0]_en")]
-          [:dt "Note"] [:dd (get-or-none "note[0]_en")]
-          [:dt "Labels"] [:dd [:span.label.primary-label (get-or-none "*label_en")]
-                          (->> (range 9) (map #(str "altLabel[" % "]_en"))
-                               (map (comp row keyword)) (filter some?)
-                               (map #(vector :span.label.alt-label %)))]
-          [:dt "Instruction number"] [:dd (get-or-none "instructionNumber")]
-          [:dt "Lexical alias"] [:dd (get-or-none "lexicalAlias_en")]
-          [:dt "Status"] [:dd (get-or-none "*status")])))
+  (list [:dt "Description"] [:dd (get-or-none row "description[0]_en")]
+        [:dt "Note"] [:dd (get-or-none row "note[0]_en")]
+        [:dt "Labels"] [:dd [:span.label.primary-label (get-or-none row "*label_en")]
+                        (->> (range 9) (map #(str "altLabel[" % "]_en"))
+                             (map (comp row keyword)) (filter some?)
+                             (map #(vector :span.label.alt-label %)))]
+        [:dt "Instruction number"] [:dd (get-or-none row "instructionNumber")]
+        [:dt "Lexical alias"] [:dd (get-or-none row "lexicalAlias_en")]
+        [:dt "Status"] [:dd (get-or-none row "*status")]))
 
 (defn subclass-of [row]
   (let [parents (traverse row "subClassOf")
@@ -159,14 +205,13 @@
                       (when (some seq parents)
                         [:ul.inheritance
                          (for [[row parents] parents]
-                           [:li [:a {:href (str "/" (:id row))} (label row)]
+                           [:li (entity-link row)
                             (when (seq parents)
                               (nested-list parents))])]))]
     (list [:dt "Subclass of"]
           [:dd (or (nested-list parents) "-")])))
 
 ;; TODO
-;; - tooltip for description of superclasses on mouseover
 ;; - superclasses
 
 (defn by-id [{[id] :params}]
