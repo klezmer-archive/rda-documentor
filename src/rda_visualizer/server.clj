@@ -139,7 +139,10 @@
    }
    ")
 
-(defn- get-or-none [row k]
+;; Helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn get-or-none [row k]
   (-> k keyword row (as-> $ (if-not $ "-" $))))
 
 (defn label [row]
@@ -149,6 +152,103 @@
   [:a.tooltip {:href (str "/" (:id row))}
    (label row)
    [:span.tooltip-text (get-or-none row "description[0]_en")]])
+
+(defn get-by-uri [uri]
+  (-> (h/select :*)
+      (h/where := :*uri uri)
+      (h/limit 1)
+      query first))
+
+;; Sub/super class/properties
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; TODO: the code for superclasses and subclasses is nearly, but not exactly, identical. Find some
+;; way to factor it out? Maybe after switching to a triplestore?
+(defn traverse-down [row col-prefix]
+  (let [cols (->> row keys (map name)
+                  (filter #(str/starts-with? % col-prefix))
+                  (map keyword))
+        col-vals (comp set (apply juxt cols))
+        dfs (fn dfs [explore seen]
+              (into
+               {}
+               (for [uri explore
+                     :when (not (seen uri))
+                     ;; Some rows share uris, we just pick the first arbitrarily since we show the
+                     ;; correspondence in the ui so users can always navigate from whichever one we
+                     ;; picked to the other
+                     :let [row (get-by-uri uri)]]
+                 ;; This is not tail-recursive, but the max depths are likely to be small and it's
+                 ;; way easier to build a tree this way
+                 [row (dfs (filter some? (col-vals row))
+                           (conj seen uri))])))]
+    (dfs (filter some? (col-vals row)) #{(:*uri row)})))
+(comment
+  (traverse-down (-> (h/select :*) (h/where [:is-not (keyword "subClassOf[0]") nil]) (h/limit 1) query first)
+                 "subClassOf")
+  ;; => {"rdac:C10013" {}}
+  ;; ish, keys are whole rows
+  )
+
+(defn traverse-up [row col-prefix]
+  (let [cols (->> row keys (map name)
+                  (filter #(str/starts-with? % col-prefix))
+                  (map keyword))
+        ;; select-distinct because uris aren't unique and we don't want to show dups in the tree. If
+        ;; there are dups, this picks one arbitrarily. The UI shows a link to the other, so users
+        ;; can navigate to it if needed.
+        get-parents #(-> (h/select :* [[:min :id]])
+                         (h/where (into [:or] (for [col cols] [:= col (:*uri %)])))
+                         (h/group-by :*uri)
+                         query)
+        dfs (fn dfs [explore seen]
+              (into {}
+                    (for [parent explore
+                          :when (not (seen (:*uri parent)))]
+                      [parent (dfs (get-parents parent)
+                                   (conj seen (:*uri parent)))])))]
+    (dfs (get-parents row) #{(:*uri row)})))
+(comment
+  (traverse-up (-> (h/select :*) (h/where [:= :id "rof.csv:6"]) query first)
+               "subClassOf")
+  ;; {"rof.csv:3" {"rof.csv:8" {}, "rof.csv:9" {}},
+  ;;  "rof.csv:4" {"rof.csv:2" {}, "rof.csv:9" {}},
+  ;;  "rof.csv:5" {"rof.csv:1" {}, "rof.csv:8" {}},
+  ;;  "rof.csv:7" {"rof.csv:1" {}, "rof.csv:2" {}}}
+  ;; Kinda, except keys are whole rows
+  )
+
+(defn nested-list [parents]
+  (when (some seq parents)
+    [:ul.inheritance
+     (for [[row parents] parents]
+       [:li (entity-link row)
+        (when (seq parents)
+          (nested-list parents))])]))
+
+(defn subclass-of [row]
+  (let [parents (traverse-down row "subClassOf")]
+    (list [:dt "Subclass of"]
+          [:dd (or (nested-list parents) "-")])))
+
+(defn subclassed-by
+  [row]
+  (let [parents (traverse-up row "subClassOf")]
+    (list [:dt "Subclassed by"]
+          [:dd (or (nested-list parents) "-")])))
+
+(defn subproperty-of [row]
+  (let [parents (traverse-down row "subPropertyOf")]
+    (list [:dt "Subproperty of"]
+          [:dd (or (nested-list parents) "-")])))
+
+(defn superproperty-of [row]
+  (let [parents (traverse-up row "subPropertyOf")]
+    (list [:dt "Superproperty of"]
+          [:dd (or (nested-list parents) "-")])))
+
+;; Attributes
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn same-uri-as [{id :id, uri :*uri}]
   (when-let [others (-> (h/select :id)
@@ -171,93 +271,20 @@
         [:dt "Lexical alias"] [:dd (get-or-none row "lexicalAlias_en")]
         [:dt "Status"] [:dd (get-or-none row "*status")]))
 
-(defn get-superclasses [row]
-  (let [cols (->> row keys (map name)
-                  (filter #(str/starts-with? % "subClassOf"))
-                  (map keyword))
-        col-vals (comp set (apply juxt cols))
-        dfs (fn dfs [explore seen]
-              (into
-               {}
-               (for [uri explore
-                     :when (not (seen uri))
-                     ;; Some rows share uris, we just pick the first arbitrarily since we show the
-                     ;; correspondence in the ui so users can always navigate from whichever one we
-                     ;; picked to the other
-                     :let [row (-> (apply h/select [:*])
-                                   (h/where := :*uri uri)
-                                   (h/limit 1)
-                                   query first)]]
-                 ;; This is not tail-recursive, but the max depths are likely to be small and it's
-                 ;; way easier to build a tree this way
-                 [row (dfs (filter some? (col-vals row))
-                           (conj seen uri))])))]
-    (dfs (filter some? (col-vals row)) #{(:*uri row)})))
+(defn property-attributes [row]
+  (list [:dt "Domain"] [:dd (or (some-> row :domain get-by-uri entity-link) "-")]
+        [:dt "Range"] [:dd (or (some-> row :range get-by-uri entity-link) "-")]))
 (comment
-  (get-subclasses (-> (h/select :*) (h/where [:is-not (keyword "subClassOf[0]") nil]) (h/limit 1) query first))
-  ;; => {"rdac:C10013" {}}
-  ;; ish, keys are whole rows
+  (-> (h/where [:is-not :owl:propertyChainAxiom nil]) (h/select :owl:propertyChainAxiom) query)
+  (get-by-uri "rdat:P70001")
   )
 
-(defn subclass-of [row]
-  (let [parents (get-superclasses row)
-        nested-list (fn nested-list [parents]
-                      (when (some seq parents)
-                        [:ul.inheritance
-                         (for [[row parents] parents]
-                           [:li (entity-link row)
-                            (when (seq parents)
-                              (nested-list parents))])]))]
-    (list [:dt "Subclass of"]
-          [:dd (or (nested-list parents) "-")])))
-
-;; TODO: the code for superclasses and subclasses is nearly, but not exactly, identical. Find some
-;; way to factor it out? Maybe after switching to a triplestore?
-(defn get-subclasses [row]
-  (let [cols (->> row keys (map name)
-                  (filter #(str/starts-with? % "subClassOf"))
-                  (map keyword))
-        ;; select-distinct because uris aren't unique and we don't want to show dups in the tree. If
-        ;; there are dups, this picks one arbitrarily. The UI shows a link to the other, so users
-        ;; can navigate to it if needed.
-        get-parents #(-> (h/select :* [[:min :id]])
-                         (h/where (into [:or] (for [col cols] [:= col (:*uri %)])))
-                         (h/group-by :*uri)
-                         query)
-        dfs (fn dfs [explore seen]
-              (into {}
-                    (for [parent explore
-                          :when (not (seen (:*uri parent)))]
-                      [parent (dfs (get-parents parent)
-                                   (conj seen (:*uri parent)))])))]
-    (dfs (get-parents row) #{(:*uri row)})))
-(comment
-  (get-subclasses (-> (h/select :*) (h/where [:= :id "rof.csv:6"]) query first))
-  ;; {"rof.csv:3" {"rof.csv:8" {}, "rof.csv:9" {}},
-  ;;  "rof.csv:4" {"rof.csv:2" {}, "rof.csv:9" {}},
-  ;;  "rof.csv:5" {"rof.csv:1" {}, "rof.csv:8" {}},
-  ;;  "rof.csv:7" {"rof.csv:1" {}, "rof.csv:2" {}}}
-  ;; Kinda, except keys are whole rows
-  )
-
-(defn subclassed-by
-  [row]
-  (let [parents (get-subclasses row)
-        nested-list (fn nested-list [parents]
-                      (when (some seq parents)
-                        [:ul.inheritance
-                         (for [[row parents] parents]
-                           [:li (entity-link row)
-                            (when (seq parents)
-                              (nested-list parents))])]))]
-    (list [:dt "Subclassed by"]
-          [:dd (or (nested-list parents) "-")])))
+;; Handlers
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn by-id [{[id] :params}]
-  (if-let [row (->  (h/where := :id id)
-                    (h/limit 1)
-                    query
-                    first)]
+  (if-let [row (->  (h/where := :id id) (h/limit 1)
+                    query first)]
     {:status 200
      :headers {"Content-Type" "text/html"}
      :body
@@ -275,10 +302,16 @@
           (same-uri-as row)
           [:dl
            (general-attributes row)
-           (when (= "class" (:*type row))
-             (list (subclass-of row)
-                   (subclassed-by row)))]]]]))}
+           (case (:*type row)
+             "class" (list (subclass-of row)
+                           (subclassed-by row))
+             "property" (list (property-attributes row)
+                              (subproperty-of row)
+                              (superproperty-of row)))]]]]))}
     {:status 404}))
+
+;; Server
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (def routes {[:get #"/([a-zA-Z0-9:.]+)"] #'by-id})
 
