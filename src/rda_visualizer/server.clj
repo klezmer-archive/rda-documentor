@@ -1,12 +1,11 @@
 (ns rda-visualizer.server
   (:require [babashka.pods :as pods]
-            [clojure.set :as set]
             [clojure.string :as str]
             [hiccup2.core :refer [html raw]]
-            [honey.sql :as sql]
             [honey.sql.helpers :as h]
             [org.httpkit.server :as httpkit]
-            [rda-visualizer.db :refer [query]]))
+            [rda-visualizer.db :refer [query]]
+            [rda-visualizer.util :refer [spy]]))
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
 (require '[pod.babashka.go-sqlite3 :as sqlite])
@@ -137,6 +136,11 @@
      top: 15px;
      left: -20px;
    }
+   th {
+     position: sticky;
+     top: 0;
+     background-color: #f9f9f9;
+   }
    ")
 
 ;; Helpers
@@ -149,9 +153,11 @@
   (or (:ToolkitLabel_en row) (:*label_en row)))
 
 (defn entity-link [row]
-  [:a.tooltip {:href (str "/" (:id row))}
-   (label row)
-   [:span.tooltip-text (get-or-none row "description[0]_en")]])
+  (if row
+    [:a.tooltip {:href (str "/" (:id row))}
+     (label row)
+     [:span.tooltip-text (get-or-none row "description[0]_en")]]
+    "-"))
 
 (defn get-by-uri [uri]
   (-> (h/select :*)
@@ -247,6 +253,43 @@
     (list [:dt "Superproperty of"]
           [:dd (or (nested-list parents) "-")])))
 
+;; Class property table
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defn flatten-map [m]
+  (->> m
+       (map #(vector (key %) (flatten-map (val %))))
+       flatten))
+
+(defn class-properties [row mode]
+  [:table
+   [:thead [:tr [:th "Label"] [:th "URI"]
+            [:th (case mode
+                   :domain "Range"
+                   :range "Domain")]
+            [:th "Inherited from"]]]
+   ;; Any property this class could be involved in, which means including properties inherited from
+   ;; superclasses
+   [:tbody (for [prop (query (h/where [:in mode (-> (flatten-map (traverse-down row "subClassOf"))
+                                                    (conj row)
+                                                    (as-> $ (map :*uri $)))]))]
+             [:tr
+              [:td (entity-link prop)]
+              [:td (:*uri prop)]
+              [:td (entity-link (-> (h/where [:= :*uri
+                                              (get prop (case mode
+                                                          :domain :range
+                                                          :range :domain))])
+                                        ;; Arbitrarily first, see related comments
+                                    query first))]
+              [:td (if (= (:*uri row) (get prop mode))
+                     "-"
+                     (entity-link (get-by-uri (get prop mode))))]])]])
+(comment
+  (def row (-> (h/where [:= :*type "class"]) (h/limit 1) query first))
+  row
+  (class-properties (-> (h/where [:= :id "rdac.csv:1"]) (h/limit 1) query first)
+                    :domain)
+  )
 ;; Attributes
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -271,13 +314,17 @@
         [:dt "Lexical alias"] [:dd (get-or-none row "lexicalAlias_en")]
         [:dt "Status"] [:dd (get-or-none row "*status")]))
 
-(defn property-attributes [row]
-  (list [:dt "Domain"] [:dd (or (some-> row :domain get-by-uri entity-link) "-")]
-        [:dt "Range"] [:dd (or (some-> row :range get-by-uri entity-link) "-")]))
 (comment
   (-> (h/where [:is-not :owl:propertyChainAxiom nil]) (h/select :owl:propertyChainAxiom) query)
   (get-by-uri "rdat:P70001")
   )
+
+;; TODO
+;; - search
+;; - table pagination, filter, search, sort
+;; - something to make long inheritance chains less awful
+;; - for properties: table of applicable classes?
+;; - homepage
 
 ;; Handlers
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -305,9 +352,20 @@
            (case (:*type row)
              "class" (list (subclass-of row)
                            (subclassed-by row))
-             "property" (list (property-attributes row)
+             "property" (list [:dt "Domain"] [:dd (or (some-> row :domain get-by-uri entity-link) "-")]
+                              [:dt "Range"] [:dd (or (some-> row :range get-by-uri entity-link) "-")]
                               (subproperty-of row)
-                              (superproperty-of row)))]]]]))}
+                              (superproperty-of row)
+                              [:dt "Inverse of"] [:dd (get-or-none row "inverseOf")]
+                              [:dt "See Also"] [:dd (get-or-none row "See Also[0]")]
+                              ;; Skipping "has element type" and "owl:propertyChainAxiom" because I
+                              ;; have no idea what they mean
+                              ))]
+          (when (= "class" (:*type row))
+            (list [:h2 "Domain Properties"]
+                  (class-properties row :domain)
+                  [:h2 "Range Properties"]
+                  (class-properties row :range)))]]]))}
     {:status 404}))
 
 ;; Server
