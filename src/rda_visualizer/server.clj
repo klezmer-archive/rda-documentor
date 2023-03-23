@@ -5,7 +5,8 @@
             [honey.sql.helpers :as h]
             [org.httpkit.server :as httpkit]
             [rda-visualizer.db :refer [query]]
-            [rda-visualizer.util :refer [spy]]))
+            [rda-visualizer.util :refer [spy]])
+  (:import java.net.URLDecoder))
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
 (require '[pod.babashka.go-sqlite3 :as sqlite])
@@ -27,7 +28,7 @@
 ;; - :lexicalAlias_en
 ;; - :note[0]_en
 ;; - :altLabel[0]_en
-;; - :ToolkitDefinition_en
+;; - :ToolkitDefinition_en  -I didn't use? Might've accidentally skipped
 ;; - :*status
 ;; 
 ;; On some classes
@@ -62,6 +63,17 @@
 
 (def styles
   "
+   header {
+     position: sticky;
+     top: 0;
+     background-color: #f9f9f9;
+   }
+   div.search {
+     float: right;
+   }
+   div.home {
+     float: left;
+   }
    a {
      color: #0001ee;
    }
@@ -154,7 +166,7 @@
 
 (defn entity-link [row]
   (if row
-    [:a.tooltip {:href (str "/" (:id row))}
+    [:a.tooltip {:href (str "/entity/" (:id row))}
      (label row)
      [:span.tooltip-text (get-or-none row "description[0]_en")]]
     "-"))
@@ -301,7 +313,7 @@
                         seq)]
     (list [:h4 "Same URI as"]
           (for [o others]
-            [:a {:href (str "/" (:id o))} (:id o)]))))
+            [:a {:href (str "/entity/" (:id o))} (:id o)]))))
 
 (defn general-attributes [row]
   (list [:dt "Description"] [:dd (get-or-none row "description[0]_en")]
@@ -319,12 +331,24 @@
   (get-by-uri "rdat:P70001")
   )
 
+(defn base-page [& content]
+  [:html {:lang "en"}
+   [:head
+    [:title "RDA Visualizer"]
+    [:link {:rel "stylesheet" :href "https://unpkg.com/sakura.css/css/sakura.css" :type "text/css"}]
+    [:style (raw styles)]]
+   [:body
+    [:header
+     [:div.home [:a {:href "/"} "Home"]]
+     [:div.search [:form {:method "get", :action "/search"}
+                   [:input {:type "search", :name "q", :required true}]
+                   [:button {:type "submit"} "Search"]]]]
+    [:main content]]])
+
 ;; TODO
-;; - search
 ;; - table pagination, filter, search, sort
 ;; - something to make long inheritance chains less awful
 ;; - for properties: table of applicable classes?
-;; - homepage
 
 ;; Handlers
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -337,41 +361,98 @@
      :body
      (str
       (html
-       [:html {:lang "en"}
-        [:head
-         [:title "RDA Visualizer"]
-         [:link {:rel "stylesheet" :href "https://unpkg.com/sakura.css/css/sakura.css" :type "text/css"}]
-         [:style (raw styles)]]
-        [:body
-         [:main
-          [:h1 (:*type row) ": " (label row)]
-          [:div.subtitle (:*uri row)]
-          (same-uri-as row)
-          [:dl
-           (general-attributes row)
-           (case (:*type row)
-             "class" (list (subclass-of row)
-                           (subclassed-by row))
-             "property" (list [:dt "Domain"] [:dd (or (some-> row :domain get-by-uri entity-link) "-")]
-                              [:dt "Range"] [:dd (or (some-> row :range get-by-uri entity-link) "-")]
-                              (subproperty-of row)
-                              (superproperty-of row)
-                              [:dt "Inverse of"] [:dd (get-or-none row "inverseOf")]
-                              [:dt "See Also"] [:dd (get-or-none row "See Also[0]")]
+       (base-page
+        [:h1 (:*type row) ": " (label row)]
+        [:div.subtitle (:*uri row)]
+        (same-uri-as row)
+        [:dl
+         (general-attributes row)
+         (case (:*type row)
+           "class" (list (subclass-of row)
+                         (subclassed-by row))
+           "property" (list [:dt "Domain"] [:dd (or (some-> row :domain get-by-uri entity-link) "-")]
+                            [:dt "Range"] [:dd (or (some-> row :range get-by-uri entity-link) "-")]
+                            (subproperty-of row)
+                            (superproperty-of row)
+                            [:dt "Inverse of"] [:dd (get-or-none row "inverseOf")]
+                            [:dt "See Also"] [:dd (get-or-none row "See Also[0]")]
                               ;; Skipping "has element type" and "owl:propertyChainAxiom" because I
                               ;; have no idea what they mean
-                              ))]
-          (when (= "class" (:*type row))
-            (list [:h2 "Domain Properties"]
-                  (class-properties row :domain)
-                  [:h2 "Range Properties"]
-                  (class-properties row :range)))]]]))}
+                            ))]
+        (when (= "class" (:*type row))
+          (list [:h2 "Domain Properties"]
+                (class-properties row :domain)
+                [:h2 "Range Properties"]
+                (class-properties row :range))))))}
     {:status 404}))
+
+(defn homepage [_]
+  {:status 200
+   :headers {"Content-Type" "text/html"}
+   :body (str 
+          (html
+           (base-page
+            [:h1 "Classes"]
+            [:ul
+             (for [c (query (h/where [:= :*type "class"]))]
+               [:li (entity-link c)])]
+            [:h2 "Properties"]
+            [:ul
+             (for [p (query (h/where [:= :*type "property"]))]
+               [:li (entity-link p)])])))})
+
+(defn parse-querystring [qs]
+  (->> (str/split qs #" ")
+       (map #(str/split % #"=" 2))
+       (map #(vector (first %) (java.net.URLDecoder/decode (second %))))
+       (into {})))
+(comment
+  (parse-querystring "q=hi%20bye a=1")
+  ;; => {"q" "hi bye", "a" "1"}
+
+  )
+
+(defn search [{qs :query-string}]
+  (let [{search-query "q"} (parse-querystring qs)
+        ;; In search priority order
+        search-columns [:*uri :*label_en (keyword "description[0]_en")
+                        :ToolkitLabel_en :lexicalAlias_en
+                        (keyword "note[0]_en") (keyword "altLabel[0]_en")
+                        (keyword "altLabel[1]_en") (keyword "altLabel[2]_en")
+                        (keyword "altLabel[3]_en") (keyword "altLabel[4]_en")
+                        (keyword "altLabel[5]_en") (keyword "altLabel[6]_en")
+                        (keyword "altLabel[7]_en") (keyword "altLabel[8]_en")]
+        keyfn (fn [row]
+                (let [matching-columns (->> (keys row) (map name) (filter #(str/starts-with? % "matching_"))
+                                            (filter #(= 1 (get row (keyword %))))
+                                            (map #(str/replace-first % #"matching_" ""))
+                                            (map keyword))]
+
+                  (->> search-columns
+                       (map-indexed #(when (contains? (set matching-columns) %2) %1))
+                       (filter some?)
+                       first)))
+        matching (-> (apply h/select :*
+                            (for [c search-columns]
+                              [[:like c (str "%" search-query "%")] (keyword (str "matching-" (name c)))]))
+                     (h/where
+                      (into [:or]
+                            (for [c search-columns]
+                              [:like c (str "%" search-query "%")])))
+                     query
+                     (->> (sort-by keyfn)))]
+    
+    {:status 200
+     :body (str (html (base-page [:h1 "Results: " search-query]
+                                 [:ul (for [m matching]
+                                        [:li (entity-link m)])])))}))
 
 ;; Server
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(def routes {[:get #"/([a-zA-Z0-9:.]+)"] #'by-id})
+(def routes {[:get #"/entity/([a-zA-Z0-9:.]+)"] #'by-id
+             [:get #"/"] #'homepage
+             [:get #"/search"] #'search})
 
 (defn route
   "Given routes and a request, returns a response generated by a matching
@@ -382,7 +463,7 @@
                 (keep (fn [[[method pattern] handler]]
                         (when (and (= method (:request-method req))
                                    (some? (re-matches pattern (:uri req))))
-                                         ;; `rest` b/c the first group is always the whole match
+                          ;; `rest` b/c the first group is always the whole match
                           [handler (assoc req :params (rest (re-matches pattern (:uri req))))])))
                 first)]
     (handler req')
